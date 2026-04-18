@@ -1,3 +1,4 @@
 plotly
 streamlit-aggrid
 streamlit-option-menu
+openai
