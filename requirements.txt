@@ -3,4 +3,4 @@ streamlit-aggrid
 streamlit-option-menu
 openai
 openpyxl
-streamlit==1.20.0
+streamlit==1.55.0
