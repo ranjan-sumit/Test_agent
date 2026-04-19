@@ -4,3 +4,4 @@ streamlit-option-menu
 openai
 openpyxl
 streamlit==1.55.0
+networkx
