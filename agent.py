@@ -1,358 +1,1071 @@
+# # """
+# # agent.py — ARIA Agentic Intelligence Engine
+# # Rebuilt with:
+# # - Robust JSON parsing (regex-based, handles all markdown fence variants)
+# # - Agentic multi-step reasoning for Material Intelligence
+# # - Supplier consolidation order draft
+# # - Monte Carlo demand simulation
+# # - Supply disruption ranking
+# # - Chart interpretation via LLM
+# # """
+
+# # import re, json, math, random
+# # from typing import Optional, Dict, List, Any
+# # from openai import AzureOpenAI
+
+
+# # def get_azure_client(api_key: str, endpoint: str, api_version: str = "2025-01-01-preview"):
+# #     return AzureOpenAI(api_key=api_key, azure_endpoint=endpoint, api_version=api_version)
+
+
+# # def _parse_json(raw: str) -> Optional[Dict]:
+# #     """Robust JSON extraction — handles all markdown fence variants."""
+# #     if not raw: return None
+# #     # Remove markdown fences
+# #     cleaned = re.sub(r'^```(?:json)?\s*', '', raw.strip())
+# #     cleaned = re.sub(r'\s*```\s*$', '', cleaned).strip()
+# #     try:
+# #         return json.loads(cleaned)
+# #     except Exception:
+# #         # Try to extract JSON object with regex
+# #         match = re.search(r'\{.*\}', cleaned, re.DOTALL)
+# #         if match:
+# #             try: return json.loads(match.group())
+# #             except: pass
+# #     return None
+
+
+# # # ── System prompt ──────────────────────────────────────────────────────────────
+# # SYSTEM_PROMPT = """You are ARIA — an agentic supply chain intelligence system for Revvity Turku plant FI11.
+
+# # You reason step-by-step like a senior procurement analyst giving an executive briefing.
+# # Rules:
+# # - Cite specific numbers always
+# # - Reference actual periods (e.g. "Nov 2025")  
+# # - Connect patterns to consequences
+# # - Surface lead time prominently — it determines urgency
+# # - Safety Stock sourced from Material Master (Current Inventory = 0 for all SKUs, known data gap)
+# # - Lead Time = max(Planned Delivery, Inhouse Production Time) from Material Master
+# # - Replenishment formula: CEILING(Shortfall/FLS)×FLS where Shortfall = SS - Stock
+
+# # Return ONLY valid JSON. No markdown, no code fences, no preamble.
+# # JSON keys required:
+# # - headline: one sentence, max 20 words, most critical fact
+# # - verdict: CRITICAL | WARNING | HEALTHY | INSUFFICIENT_DATA
+# # - executive_summary: 3-4 sentences, what/why/pattern
+# # - key_findings: array of exactly 3 specific numbered findings
+# # - sap_gap: one sentence on what SAP is missing
+# # - recommendation: structured recommendation with SKU/inventory/SS/lead-time/lot-size/order-qty/reason
+# # - risk_if_ignored: one sentence consequence
+# # - data_confidence: HIGH | MEDIUM | LOW — one sentence explanation
+# # - data_quality_flags: array of data quality issues (empty if none)
+# # - bom_risk: one sentence on BOM/supplier risk (null if no BOM)
+# # - supplier_action: if replenishment needed, draft a one-sentence action for procurement team"""
+
+
+# # def analyse_material(client: AzureOpenAI, deployment: str, context: dict) -> dict:
+# #     """Agentic multi-step analysis. Returns structured dict."""
+# #     repl = context.get("replenishment", {})
+# #     repl_text = (
+# #         f"REPLENISHMENT REQUIRED: Order {repl['quantity']} units "
+# #         f"(Shortfall={repl['shortfall']}, Formula: {repl['formula']})"
+# #         if repl.get("triggered")
+# #         else f"No replenishment triggered: {repl.get('reason','stock above safety stock')}"
+# #     )
+
+# #     bom = context.get("bom_components", [])
+# #     external_bom = [b for b in bom if not b.get("inhouse") and not b.get("supplier","").startswith("⚠")]
+# #     missing_bom  = [b for b in bom if b.get("supplier","").startswith("⚠")]
+# #     fixed_qty    = [b for b in bom if b.get("fixed_qty")]
+
+# #     consolidation = context.get("supplier_consolidation", [])
+# #     consol_text = ""
+# #     if consolidation:
+# #         consol_text = "SUPPLIER CONSOLIDATION: " + "; ".join([
+# #             f"{c['supplier']} also supplies {c['also_supplies']} other finished goods"
+# #             for c in consolidation[:3]
+# #         ])
+
+# #     prompt = f"""Analyse this supply chain material and produce an agentic intelligence briefing.
+
+# # MATERIAL CONTEXT:
+# # {json.dumps(context, indent=2, default=str)}
+
+# # PRE-COMPUTED REPLENISHMENT:
+# # {repl_text}
+
+# # LEAD TIME URGENCY: {context.get('lt_urgency','unknown')}
+
+# # BOM FACTS:
+# # - Total components: {len(bom)}
+# # - External components (need procurement): {len(external_bom)}
+# # - Missing supplier data: {len(missing_bom)} components
+# # - Fixed quantity (order exactly 1): {len(fixed_qty)} components
+# # {consol_text}
+
+# # STEP-BY-STEP ANALYSIS REQUIRED:
+# # 1. Is current stock genuinely safe given lead time? (compare days_cover vs lead_time_days)
+# # 2. Is the SAP safety stock calibrated correctly vs ARIA formula?
+# # 3. What pattern caused the {len(context.get('breach_periods',[]))} historical breaches?
+# # 4. What is the BOM/supplier risk upstream?
+# # 5. What specific action should procurement take TODAY?
+
+# # Format the recommendation section EXACTLY as:
+# # SKU: [id] — [name]
+# # Current inventory: [n] units  
+# # Safety stock (Material Master): [n] units — [BELOW/ABOVE threshold]
+# # Lead time (Material Master): [n] days — [CRITICAL/OK relative to days cover]
+# # Fixed lot size: [n] units
+# # Recommended order: [Immediate/This week/Monitor], [n] units
+# # Reason: [specific sentence with numbers]
+# # """
+
+# #     try:
+# #         response = client.chat.completions.create(
+# #             model=deployment,
+# #             messages=[
+# #                 {"role": "system", "content": SYSTEM_PROMPT},
+# #                 {"role": "user",   "content": prompt},
+# #             ],
+# #             temperature=0.15,
+# #             max_tokens=1000,
+# #         )
+# #         raw = response.choices[0].message.content.strip()
+# #         result = _parse_json(raw)
+# #         if result:
+# #             result.setdefault("data_quality_flags", context.get("data_quality_flags", []))
+# #             result.setdefault("bom_risk", None)
+# #             result.setdefault("supplier_action", None)
+# #             return result
+# #         # Parse failed — return graceful degradation with raw content visible
+# #         return {
+# #             "headline": "Analysis requires review — see findings below",
+# #             "verdict": context.get("risk_status","UNKNOWN"),
+# #             "executive_summary": raw[:500] if raw else "No response from agent.",
+# #             "key_findings": ["See executive summary above.", repl_text, f"Lead time urgency: {context.get('lt_urgency','N/A')}"],
+# #             "sap_gap": f"SAP Safety Stock: {context.get('safety_stock_sap','N/A')} units. ARIA recommends: {context.get('rec_safety_stock','N/A')} units.",
+# #             "recommendation": repl_text,
+# #             "risk_if_ignored": "Review replenishment status immediately." if repl.get("triggered") else "Monitor stock levels.",
+# #             "data_confidence": "LOW — JSON parse issue. Response shown in executive summary.",
+# #             "data_quality_flags": context.get("data_quality_flags", []),
+# #             "bom_risk": None,
+# #             "supplier_action": None,
+# #             "_raw": raw,
+# #         }
+# #     except Exception as e:
+# #         return {
+# #             "headline": "Agent connection error",
+# #             "verdict": context.get("risk_status","UNKNOWN"),
+# #             "executive_summary": f"Error: {str(e)[:200]}",
+# #             "key_findings": [repl_text, "Check Azure API key.", "Review data manually."],
+# #             "sap_gap": "Unable to connect to agent.",
+# #             "recommendation": repl_text,
+# #             "risk_if_ignored": "Manual review required.",
+# #             "data_confidence": "LOW — connection error.",
+# #             "data_quality_flags": context.get("data_quality_flags", []),
+# #             "bom_risk": None, "supplier_action": None,
+# #         }
+
+
+# # def run_monte_carlo(
+# #     current_stock: float, safety_stock: float, avg_demand: float,
+# #     std_demand: float, lead_time: float, months: int = 6, n_sims: int = 1000
+# # ) -> dict:
+# #     """
+# #     Monte Carlo simulation: run 1000 demand scenarios.
+# #     Returns probability distribution of stockout, percentile outcomes.
+# #     """
+# #     breach_count = 0
+# #     end_stocks   = []
+# #     breach_months = []
+
+# #     random.seed(42)
+# #     for _ in range(n_sims):
+# #         stock = current_stock
+# #         breached = False
+# #         breach_m = None
+# #         for m in range(months):
+# #             # Sample demand from normal distribution (floor at 0)
+# #             d = max(0.0, random.gauss(avg_demand, std_demand))
+# #             stock = max(0.0, stock - d)
+# #             if stock < safety_stock and not breached:
+# #                 breached = True
+# #                 breach_m = m + 1
+# #         if breached:
+# #             breach_count += 1
+# #             breach_months.append(breach_m)
+# #         end_stocks.append(stock)
+
+# #     end_stocks.sort()
+# #     p_breach = round(breach_count / n_sims * 100, 1)
+# #     p10 = end_stocks[int(0.10 * n_sims)]
+# #     p50 = end_stocks[int(0.50 * n_sims)]
+# #     p90 = end_stocks[int(0.90 * n_sims)]
+# #     avg_breach_month = round(sum(breach_months) / len(breach_months), 1) if breach_months else None
+
+# #     return {
+# #         "n_simulations": n_sims,
+# #         "months_simulated": months,
+# #         "probability_breach_pct": p_breach,
+# #         "avg_breach_month": avg_breach_month,
+# #         "p10_end_stock": round(p10, 0),
+# #         "p50_end_stock": round(p50, 0),
+# #         "p90_end_stock": round(p90, 0),
+# #         "end_stock_distribution": [round(v, 0) for v in end_stocks[::10]],  # every 10th for chart
+# #         "verdict": "HIGH RISK" if p_breach>50 else ("MODERATE RISK" if p_breach>20 else ("LOW RISK" if p_breach>5 else "VERY LOW RISK")),
+# #     }
+
+
+# # def draft_supplier_email(
+# #     client: AzureOpenAI, deployment: str,
+# #     supplier_name: str, supplier_email: str,
+# #     materials: list, plant_name: str = "Revvity Turku FI11"
+# # ) -> str:
+# #     """Draft a procurement order email to a supplier covering multiple materials."""
+# #     order_lines = "\n".join([
+# #         f"  - {m['name']}: {m['quantity']} units (lot size: {m['lot_size']})"
+# #         for m in materials
+# #     ])
+# #     prompt = f"""Draft a professional procurement order email to {supplier_name} ({supplier_email}).
+# # Plant: {plant_name}
+# # Materials to order:
+# # {order_lines}
+
+# # Requirements:
+# # - Professional but concise (under 150 words)
+# # - Include subject line
+# # - Reference urgency where stock is below safety stock
+# # - Include contact request for lead time confirmation
+# # - Sign off as ARIA Supply Intelligence System, {plant_name}
+
+# # Return just the email text with Subject: on first line."""
+
+# #     try:
+# #         response = client.chat.completions.create(
+# #             model=deployment,
+# #             messages=[{"role":"user","content":prompt}],
+# #             temperature=0.3, max_tokens=350,
+# #         )
+# #         return response.choices[0].message.content.strip()
+# #     except Exception as e:
+# #         return f"Error drafting email: {str(e)[:100]}"
+
+
+# # def interpret_chart(
+# #     client: AzureOpenAI, deployment: str,
+# #     chart_type: str, chart_data: dict, question: str = None
+# # ) -> str:
+# #     """Ask ARIA to interpret a chart and provide actionable insight."""
+# #     q = question or f"Interpret this {chart_type} and provide 2-3 actionable insights for supply chain managers."
+# #     prompt = f"""You are ARIA, a supply chain analyst. Interpret this {chart_type} data and give concise actionable insights.
+
+# # DATA:
+# # {json.dumps(chart_data, default=str)[:1500]}
+
+# # {q}
+
+# # Rules: Under 120 words. Plain English sentences. Cite specific numbers. Focus on what action to take."""
+
+# #     try:
+# #         response = client.chat.completions.create(
+# #             model=deployment,
+# #             messages=[{"role":"user","content":prompt}],
+# #             temperature=0.2, max_tokens=200,
+# #         )
+# #         return response.choices[0].message.content.strip()
+# #     except Exception as e:
+# #         return f"Interpretation unavailable: {str(e)[:80]}"
+
+
+# # def simulate_scenario(
+# #     client: AzureOpenAI, deployment: str,
+# #     material_name: str, current_stock: float, safety_stock: float,
+# #     lead_time: float, fixed_lot_size: float,
+# #     demand_scenarios: dict, order_action: dict = None,
+# #     disruption_days: int = None,
+# # ) -> dict:
+# #     if disruption_days is not None:
+# #         daily = demand_scenarios.get("expected", 0) / 30
+# #         consumed = daily * disruption_days
+# #         remaining = current_stock - consumed
+# #         breach = remaining < safety_stock if safety_stock > 0 else False
+# #         shortfall = max(0, safety_stock - remaining)
+# #         lot = fixed_lot_size
+# #         qty = math.ceil(shortfall / lot) * lot if lot > 0 and shortfall > 0 else shortfall
+# #         prompt = f"""Supply disruption scenario for {material_name}:
+# # - Duration: {disruption_days} days of no replenishment
+# # - Current stock: {current_stock} units
+# # - Safety stock: {safety_stock} units
+# # - Daily demand: {daily:.1f} units/day
+# # - Stock at end: {max(0,remaining):.0f} units
+# # - Breach: {breach} (shortfall: {shortfall:.0f} units if breach)
+# # - Emergency order needed: {qty:.0f} units
+
+# # Return JSON: breach_occurs, days_to_breach, shortfall_units, stock_at_end, 
+# # recommended_emergency_action, simulation_verdict, urgency (ACT TODAY/ACT THIS WEEK/MONITOR/SAFE), priority_rank (1-5)"""
+# #         default = {
+# #             "breach_occurs": breach, "days_to_breach": int(safety_stock/daily) if daily>0 and breach else None,
+# #             "shortfall_units": int(shortfall), "stock_at_end": max(0,int(remaining)),
+# #             "recommended_emergency_action": f"Emergency order {qty:.0f} units." if breach else "Monitor.",
+# #             "simulation_verdict": "Breach detected." if breach else "Safe for disruption period.",
+# #             "urgency": "ACT TODAY" if (breach and remaining<0) else ("ACT THIS WEEK" if breach else "MONITOR"),
+# #             "priority_rank": 1 if breach else 4,
+# #         }
+# #     else:
+# #         shortfall = max(0, safety_stock - current_stock)
+# #         lot = fixed_lot_size
+# #         min_order = math.ceil(shortfall / lot) * lot if lot > 0 and shortfall > 0 else shortfall
+# #         prompt = f"""Demand simulation for {material_name}:
+# # - Current stock: {current_stock}, Safety stock: {safety_stock}, Lead time: {lead_time}d
+# # - Lot size: {fixed_lot_size}
+# # - Scenarios: Low={demand_scenarios['low']:.0f}/mo, Expected={demand_scenarios['expected']:.0f}/mo, High={demand_scenarios['high']:.0f}/mo
+# # - Order placed: {json.dumps(order_action) if order_action else 'None'}
+# # - Minimum order (CEILING formula): {min_order:.0f} units
+
+# # Return JSON: low_months_safe, expected_months_safe, high_months_safe, 
+# # order_prevents_breach, min_order_recommended, simulation_verdict, urgency"""
+# #         default = {
+# #             "low_months_safe":999,"expected_months_safe":3,"high_months_safe":1,
+# #             "order_prevents_breach":bool(order_action),
+# #             "min_order_recommended":int(min_order),
+# #             "simulation_verdict":"Review parameters.","urgency":"MONITOR",
+# #         }
+
+# #     try:
+# #         response = client.chat.completions.create(
+# #             model=deployment,
+# #             messages=[{"role":"user","content":prompt}],
+# #             temperature=0.1, max_tokens=400,
+# #         )
+# #         result = _parse_json(response.choices[0].message.content.strip())
+# #         return result if result else default
+# #     except:
+# #         return default
+
+
+# # def simulate_multi_sku_disruption(
+# #     client, deployment, disruption_days: int, sku_data: list
+# # ) -> list:
+# #     results = []
+# #     for sku in sku_data:
+# #         daily = sku["avg_monthly_demand"] / 30 if sku["avg_monthly_demand"] > 0 else 0
+# #         consumed = daily * disruption_days
+# #         remaining = sku["current_stock"] - consumed
+# #         ss = sku["safety_stock"]
+# #         breach = remaining < ss if ss > 0 else False
+# #         shortfall = max(0, ss - remaining)
+# #         fls = sku["fixed_lot_size"]
+# #         qty = math.ceil(shortfall / fls) * fls if fls > 0 and shortfall > 0 else shortfall
+# #         days_to_breach = None
+# #         if breach and daily > 0 and ss > 0:
+# #             ab = sku["current_stock"] - ss
+# #             days_to_breach = max(0, int(ab / daily)) if ab > 0 else 0
+# #         results.append({
+# #             "material":sku["material"],"name":sku["name"],"breach_occurs":breach,
+# #             "days_to_breach":days_to_breach,"shortfall_units":int(shortfall),
+# #             "stock_at_end":max(0,int(remaining)),"reorder_qty":int(qty),
+# #             "lead_time":sku["lead_time"],"severity_score":shortfall*2+max(0,disruption_days-(days_to_breach or disruption_days)) if breach else 0,
+# #         })
+# #     results.sort(key=lambda x:(0 if x["breach_occurs"] else 1, x["days_to_breach"] if x["days_to_breach"] is not None else 999,-x["shortfall_units"]))
+# #     return results
+
+
+# # def chat_with_data(client: AzureOpenAI, deployment: str, question: str, context: str) -> str:
+# #     system = """You are ARIA, a supply chain intelligence agent for Revvity Turku FI11.
+# # Answer concisely with specific numbers. Under 150 words. Plain English sentences.
+# # Key sources: Safety Stock from Material Master, Lead Time from Material Master, 
+# # Lot Size from Current Inventory. Demand from Sales file."""
+# #     try:
+# #         response = client.chat.completions.create(
+# #             model=deployment,
+# #             messages=[
+# #                 {"role":"system","content":system},
+# #                 {"role":"user","content":f"CONTEXT:\n{context}\n\nQUESTION: {question}"},
+# #             ],
+# #             temperature=0.3, max_tokens=250,
+# #         )
+# #         return response.choices[0].message.content.strip()
+# #     except Exception as e:
+# #         return f"Error: {str(e)[:100]}"
+
+# """
+# agent.py — ARIA Agentic Intelligence Engine
+# Now truly agentic: pre‑computes Monte Carlo, BOM risks, consolidation,
+# and allows interactive follow‑up (what‑if order quantity / demand change).
+# """
+
+# import re, json, math, random
+# from typing import Optional, Dict, List, Any
+# from openai import AzureOpenAI
+
+# def get_azure_client(api_key: str, endpoint: str, api_version: str = "2025-01-01-preview"):
+#     return AzureOpenAI(api_key=api_key, azure_endpoint=endpoint, api_version=api_version)
+
+# def _parse_json(raw: str) -> Optional[Dict]:
+#     if not raw: return None
+#     # Remove any text before first { and after last }
+#     raw = re.sub(r'^[^{]*', '', raw.strip())
+#     raw = re.sub(r'[^}]*$', '', raw.strip())
+#     # Remove markdown fences
+#     cleaned = re.sub(r'^```(?:json)?\s*', '', raw)
+#     cleaned = re.sub(r'\s*```\s*$', '', cleaned).strip()
+#     try:
+#         return json.loads(cleaned)
+#     except Exception:
+#         match = re.search(r'\{.*\}', cleaned, re.DOTALL)
+#         if match:
+#             try: return json.loads(match.group())
+#             except: pass
+#     return None
+
+# SYSTEM_PROMPT = """You are ARIA — an agentic supply chain intelligence system for Revvity Turku plant FI11.
+
+# You reason step-by-step like a senior procurement analyst.
+# Rules:
+# - Cite specific numbers always.
+# - Reference actual periods (e.g. "Nov 2025").
+# - Connect patterns to consequences.
+# - Surface lead time and transit days prominently.
+# - Use the provided pre‑computed data: Monte Carlo probability, BOM risks, supplier consolidation.
+
+# Return ONLY valid JSON. No markdown, no code fences.
+# JSON keys required:
+# - headline: one sentence, max 20 words.
+# - verdict: CRITICAL | WARNING | HEALTHY | INSUFFICIENT_DATA.
+# - executive_summary: 3-4 sentences.
+# - key_findings: array of exactly 3 specific numbered findings.
+# - sap_gap: one sentence on what SAP is missing.
+# - recommendation: structured recommendation with SKU/inventory/SS/lead-time/lot-size/order-qty/reason.
+# - risk_if_ignored: one sentence consequence.
+# - data_confidence: HIGH | MEDIUM | LOW — one sentence explanation.
+# - data_quality_flags: array of data quality issues.
+# - bom_risk: one sentence on BOM/supplier risk (null if no BOM).
+# - supplier_action: if replenishment needed, draft a one-sentence action for procurement team.
+# - consolidation_opportunity: if applicable, mention which supplier also supplies other materials.
+# """
+
+# def analyse_material(client: AzureOpenAI, deployment: str, context: dict) -> dict:
+#     """Agentic analysis using pre‑computed data."""
+#     repl = context.get("replenishment", {})
+#     repl_text = (
+#         f"REPLENISHMENT REQUIRED: Order {repl['quantity']} units "
+#         f"(Shortfall={repl['shortfall']}, Formula: {repl['formula']})"
+#         if repl.get("triggered")
+#         else f"No replenishment triggered: {repl.get('reason','stock above safety stock')}"
+#     )
+
+#     # Pre‑compute Monte Carlo (already in context? we'll call it again to be sure)
+#     from .data_loader import get_material_context  # avoid circular import
+#     # But we already have context; we'll use the numbers in context.
+#     mc_prob = None
+#     if context["demand_stats"]["std_monthly"] > 0:
+#         from .agent import run_monte_carlo  # but careful with circular
+#         mc = run_monte_carlo(context["sih"], context["safety_stock_sap"],
+#                              context["demand_stats"]["avg_monthly"],
+#                              context["demand_stats"]["std_monthly"],
+#                              context["lead_time_days"])
+#         mc_prob = mc["probability_breach_pct"]
+
+#     bom = context.get("bom_components", [])
+#     external_bom = [b for b in bom if not b.get("inhouse") and not b.get("supplier","").startswith("⚠")]
+#     missing_bom  = [b for b in bom if b.get("supplier","").startswith("⚠")]
+#     fixed_qty    = [b for b in bom if b.get("fixed_qty")]
+
+#     consolidation = context.get("supplier_consolidation", [])
+#     consol_text = ""
+#     if consolidation:
+#         consol_text = "SUPPLIER CONSOLIDATION: " + "; ".join([
+#             f"{c['supplier']} also supplies {c['also_supplies']} other finished goods (transit {c.get('transit_days','?')}d)"
+#             for c in consolidation[:3]
+#         ])
+
+#     prompt = f"""Analyse this supply chain material and produce an agentic intelligence briefing.
+
+# MATERIAL CONTEXT:
+# {json.dumps(context, indent=2, default=str)}
+
+# PRE-COMPUTED REPLENISHMENT:
+# {repl_text}
+
+# MONTE CARLO: {mc_prob}% probability of stockout in next 6 months (if computed).
+
+# LEAD TIME URGENCY: {context.get('lt_urgency','unknown')}
+
+# BOM FACTS:
+# - Total components: {len(bom)}
+# - External components (need procurement): {len(external_bom)}
+# - Missing supplier data: {len(missing_bom)} components
+# - Fixed quantity (order exactly 1): {len(fixed_qty)} components
+# {consol_text}
+
+# STEP-BY-STEP ANALYSIS REQUIRED:
+# 1. Is current stock genuinely safe given lead time? Compare days_cover vs lead_time_days.
+# 2. Is the SAP safety stock calibrated correctly vs ARIA recommended?
+# 3. What pattern caused the {len(context.get('breach_periods',[]))} historical breaches?
+# 4. What is the BOM/supplier risk upstream (including supplier reliability, geo risk, transit times)?
+# 5. What specific action should procurement take TODAY (including consolidation if beneficial)?
+
+# Format the recommendation section EXACTLY as:
+# SKU: [id] — [name]
+# Current inventory: [n] units  
+# Safety stock (Material Master): [n] units — [BELOW/ABOVE threshold]
+# Lead time (Material Master): [n] days — [CRITICAL/OK relative to days cover]
+# Fixed lot size: [n] units
+# Recommended order: [Immediate/This week/Monitor], [n] units
+# Reason: [specific sentence with numbers]
+
+# If consolidation opportunity exists, add a line: "Consolidation: order together with [other materials] from [supplier] to save logistics cost."
+# """
+
+#     try:
+#         response = client.chat.completions.create(
+#             model=deployment,
+#             messages=[
+#                 {"role": "system", "content": SYSTEM_PROMPT},
+#                 {"role": "user",   "content": prompt},
+#             ],
+#             temperature=0.15,
+#             max_tokens=1200,
+#         )
+#         raw = response.choices[0].message.content.strip()
+#         result = _parse_json(raw)
+#         if result:
+#             result.setdefault("data_quality_flags", context.get("data_quality_flags", []))
+#             result.setdefault("bom_risk", None)
+#             result.setdefault("supplier_action", None)
+#             result.setdefault("consolidation_opportunity", None)
+#             return result
+#         # Fallback
+#         return {
+#             "headline": "Analysis requires review — see findings below",
+#             "verdict": context.get("risk_status","UNKNOWN"),
+#             "executive_summary": raw[:500] if raw else "No response from agent.",
+#             "key_findings": [repl_text, f"Lead time urgency: {context.get('lt_urgency','N/A')}", f"Monte Carlo breach prob: {mc_prob}%"],
+#             "sap_gap": f"SAP Safety Stock: {context.get('safety_stock_sap','N/A')} units. ARIA recommends: {context.get('rec_safety_stock','N/A')} units.",
+#             "recommendation": repl_text,
+#             "risk_if_ignored": "Review replenishment status immediately." if repl.get("triggered") else "Monitor stock levels.",
+#             "data_confidence": "LOW — JSON parse issue.",
+#             "data_quality_flags": context.get("data_quality_flags", []),
+#             "bom_risk": None,
+#             "supplier_action": None,
+#             "consolidation_opportunity": None,
+#         }
+#     except Exception as e:
+#         return {
+#             "headline": "Agent connection error",
+#             "verdict": context.get("risk_status","UNKNOWN"),
+#             "executive_summary": f"Error: {str(e)[:200]}",
+#             "key_findings": [repl_text, "Check Azure API key.", "Review data manually."],
+#             "sap_gap": "Unable to connect to agent.",
+#             "recommendation": repl_text,
+#             "risk_if_ignored": "Manual review required.",
+#             "data_confidence": "LOW — connection error.",
+#             "data_quality_flags": context.get("data_quality_flags", []),
+#             "bom_risk": None, "supplier_action": None, "consolidation_opportunity": None,
+#         }
+
+# def run_monte_carlo(current_stock: float, safety_stock: float, avg_demand: float,
+#                     std_demand: float, lead_time: float, months: int = 6, n_sims: int = 1000) -> dict:
+#     random.seed(42)
+#     breach_count = 0
+#     end_stocks = []
+#     breach_months = []
+#     for _ in range(n_sims):
+#         stock = current_stock
+#         breached = False
+#         breach_m = None
+#         for m in range(months):
+#             d = max(0.0, random.gauss(avg_demand, std_demand))
+#             stock = max(0.0, stock - d)
+#             if stock < safety_stock and not breached:
+#                 breached = True
+#                 breach_m = m + 1
+#         if breached:
+#             breach_count += 1
+#             breach_months.append(breach_m)
+#         end_stocks.append(stock)
+#     end_stocks.sort()
+#     p_breach = round(breach_count / n_sims * 100, 1)
+#     p10 = end_stocks[int(0.10 * n_sims)]
+#     p50 = end_stocks[int(0.50 * n_sims)]
+#     p90 = end_stocks[int(0.90 * n_sims)]
+#     avg_breach_month = round(sum(breach_months) / len(breach_months), 1) if breach_months else None
+#     return {
+#         "n_simulations": n_sims,
+#         "months_simulated": months,
+#         "probability_breach_pct": p_breach,
+#         "avg_breach_month": avg_breach_month,
+#         "p10_end_stock": round(p10, 0),
+#         "p50_end_stock": round(p50, 0),
+#         "p90_end_stock": round(p90, 0),
+#         "end_stock_distribution": [round(v, 0) for v in end_stocks[::10]],
+#         "verdict": "HIGH RISK" if p_breach>50 else ("MODERATE RISK" if p_breach>20 else ("LOW RISK" if p_breach>5 else "VERY LOW RISK")),
+#     }
+
+# def draft_supplier_email(client: AzureOpenAI, deployment: str, supplier_name: str, supplier_email: str,
+#                          materials: list, plant_name: str = "Revvity Turku FI11") -> str:
+#     order_lines = "\n".join([f"  - {m['name']}: {m['quantity']} units (lot size: {m['lot_size']})" for m in materials])
+#     prompt = f"""Draft a professional procurement order email to {supplier_name} ({supplier_email}).
+# Plant: {plant_name}
+# Materials to order:
+# {order_lines}
+
+# Requirements:
+# - Professional but concise (under 150 words)
+# - Include subject line
+# - Reference urgency where stock is below safety stock
+# - Include contact request for lead time confirmation
+# - Sign off as ARIA Supply Intelligence System, {plant_name}
+
+# Return just the email text with Subject: on first line."""
+#     try:
+#         response = client.chat.completions.create(
+#             model=deployment,
+#             messages=[{"role":"user","content":prompt}],
+#             temperature=0.3, max_tokens=350,
+#         )
+#         return response.choices[0].message.content.strip()
+#     except Exception as e:
+#         return f"Error drafting email: {str(e)[:100]}"
+
+# def interpret_chart(client: AzureOpenAI, deployment: str, chart_type: str, chart_data: dict, question: str = None) -> str:
+#     q = question or f"Interpret this {chart_type} and provide 2-3 actionable insights for supply chain managers."
+#     prompt = f"""You are ARIA, a supply chain analyst. Interpret this {chart_type} data and give concise actionable insights.
+
+# DATA:
+# {json.dumps(chart_data, default=str)[:1500]}
+
+# {q}
+
+# Rules: Under 120 words. Plain English sentences. Cite specific numbers. Focus on what action to take."""
+#     try:
+#         response = client.chat.completions.create(
+#             model=deployment,
+#             messages=[{"role":"user","content":prompt}],
+#             temperature=0.2, max_tokens=200,
+#         )
+#         return response.choices[0].message.content.strip()
+#     except Exception as e:
+#         return f"Interpretation unavailable: {str(e)[:80]}"
+
+# def simulate_scenario(client: AzureOpenAI, deployment: str, material_name: str, current_stock: float,
+#                       safety_stock: float, lead_time: float, fixed_lot_size: float,
+#                       demand_scenarios: dict, order_action: dict = None, disruption_days: int = None) -> dict:
+#     if disruption_days is not None:
+#         daily = demand_scenarios.get("expected", 0) / 30
+#         consumed = daily * disruption_days
+#         remaining = current_stock - consumed
+#         breach = remaining < safety_stock if safety_stock > 0 else False
+#         shortfall = max(0, safety_stock - remaining)
+#         lot = fixed_lot_size
+#         qty = math.ceil(shortfall / lot) * lot if lot > 0 and shortfall > 0 else shortfall
+#         prompt = f"""Supply disruption scenario for {material_name}:
+# - Duration: {disruption_days} days of no replenishment
+# - Current stock: {current_stock} units
+# - Safety stock: {safety_stock} units
+# - Daily demand: {daily:.1f} units/day
+# - Stock at end: {max(0,remaining):.0f} units
+# - Breach: {breach} (shortfall: {shortfall:.0f} units if breach)
+# - Emergency order needed: {qty:.0f} units
+
+# Return JSON: breach_occurs, days_to_breach, shortfall_units, stock_at_end, 
+# recommended_emergency_action, simulation_verdict, urgency (ACT TODAY/ACT THIS WEEK/MONITOR/SAFE), priority_rank (1-5)"""
+#         default = {
+#             "breach_occurs": breach, "days_to_breach": int(safety_stock/daily) if daily>0 and breach else None,
+#             "shortfall_units": int(shortfall), "stock_at_end": max(0,int(remaining)),
+#             "recommended_emergency_action": f"Emergency order {qty:.0f} units." if breach else "Monitor.",
+#             "simulation_verdict": "Breach detected." if breach else "Safe for disruption period.",
+#             "urgency": "ACT TODAY" if (breach and remaining<0) else ("ACT THIS WEEK" if breach else "MONITOR"),
+#             "priority_rank": 1 if breach else 4,
+#         }
+#     else:
+#         shortfall = max(0, safety_stock - current_stock)
+#         lot = fixed_lot_size
+#         min_order = math.ceil(shortfall / lot) * lot if lot > 0 and shortfall > 0 else shortfall
+#         prompt = f"""Demand simulation for {material_name}:
+# - Current stock: {current_stock}, Safety stock: {safety_stock}, Lead time: {lead_time}d
+# - Lot size: {fixed_lot_size}
+# - Scenarios: Low={demand_scenarios['low']:.0f}/mo, Expected={demand_scenarios['expected']:.0f}/mo, High={demand_scenarios['high']:.0f}/mo
+# - Order placed: {json.dumps(order_action) if order_action else 'None'}
+# - Minimum order (CEILING formula): {min_order:.0f} units
+
+# Return JSON: low_months_safe, expected_months_safe, high_months_safe, 
+# order_prevents_breach, min_order_recommended, simulation_verdict, urgency"""
+#         default = {
+#             "low_months_safe":999,"expected_months_safe":3,"high_months_safe":1,
+#             "order_prevents_breach":bool(order_action),
+#             "min_order_recommended":int(min_order),
+#             "simulation_verdict":"Review parameters.","urgency":"MONITOR",
+#         }
+#     try:
+#         response = client.chat.completions.create(
+#             model=deployment,
+#             messages=[{"role":"user","content":prompt}],
+#             temperature=0.1, max_tokens=400,
+#         )
+#         result = _parse_json(response.choices[0].message.content.strip())
+#         return result if result else default
+#     except:
+#         return default
+
+# def simulate_multi_sku_disruption(client, deployment, disruption_days: int, sku_data: list) -> list:
+#     results = []
+#     for sku in sku_data:
+#         daily = sku["avg_monthly_demand"] / 30 if sku["avg_monthly_demand"] > 0 else 0
+#         consumed = daily * disruption_days
+#         remaining = sku["current_stock"] - consumed
+#         ss = sku["safety_stock"]
+#         breach = remaining < ss if ss > 0 else False
+#         shortfall = max(0, ss - remaining)
+#         fls = sku["fixed_lot_size"]
+#         qty = math.ceil(shortfall / fls) * fls if fls > 0 and shortfall > 0 else shortfall
+#         days_to_breach = None
+#         if breach and daily > 0 and ss > 0:
+#             ab = sku["current_stock"] - ss
+#             days_to_breach = max(0, int(ab / daily)) if ab > 0 else 0
+#         results.append({
+#             "material":sku["material"],"name":sku["name"],"breach_occurs":breach,
+#             "days_to_breach":days_to_breach,"shortfall_units":int(shortfall),
+#             "stock_at_end":max(0,int(remaining)),"reorder_qty":int(qty),
+#             "lead_time":sku["lead_time"],"severity_score":shortfall*2+max(0,disruption_days-(days_to_breach or disruption_days)) if breach else 0,
+#         })
+#     results.sort(key=lambda x:(0 if x["breach_occurs"] else 1, x["days_to_breach"] if x["days_to_breach"] is not None else 999,-x["shortfall_units"]))
+#     return results
+
+# def chat_with_data(client: AzureOpenAI, deployment: str, question: str, context: str) -> str:
+#     system = """You are ARIA, a supply chain intelligence agent for Revvity Turku FI11.
+# Answer concisely with specific numbers. Under 150 words. Plain English sentences."""
+#     try:
+#         response = client.chat.completions.create(
+#             model=deployment,
+#             messages=[
+#                 {"role":"system","content":system},
+#                 {"role":"user","content":f"CONTEXT:\n{context}\n\nQUESTION: {question}"},
+#             ],
+#             temperature=0.3, max_tokens=250,
+#         )
+#         return response.choices[0].message.content.strip()
+#     except Exception as e:
+#         return f"Error: {str(e)[:100]}"
+
 """
-agent.py — Azure OpenAI GPT-4o-mini agent for ARIA.
-Updated per stakeholder requirements (Marcus / RVTY call, April 2026):
- - Replenishment formula: max(gap to safety stock, fixed lot size)
- - Lead time surfaced prominently in replenishment recommendation
- - BOM component insights included in agent context
- - Supply disruption simulation added (new scenario type)
- - Parameter sources documented in prompts
+agent.py — ARIA Agentic Intelligence Engine
+Now truly agentic: pre‑computes Monte Carlo, BOM risks, consolidation,
+and allows interactive follow‑up (what‑if order quantity / demand change).
 """
 
-import json
+import re, json, math, random
+from typing import Optional, Dict, List, Any
 from openai import AzureOpenAI
 
-
 def get_azure_client(api_key: str, endpoint: str, api_version: str = "2025-01-01-preview"):
-    """Initialise and return Azure OpenAI client."""
-    return AzureOpenAI(
-        api_key=api_key,
-        azure_endpoint=endpoint,
-        api_version=api_version,
-    )
+    return AzureOpenAI(api_key=api_key, azure_endpoint=endpoint, api_version=api_version)
 
+def _parse_json(raw: str) -> Optional[Dict]:
+    if not raw: return None
+    # Remove any text before first { and after last }
+    raw = re.sub(r'^[^{]*', '', raw.strip())
+    raw = re.sub(r'[^}]*$', '', raw.strip())
+    # Remove markdown fences
+    cleaned = re.sub(r'^```(?:json)?\s*', '', raw)
+    cleaned = re.sub(r'\s*```\s*$', '', cleaned).strip()
+    try:
+        return json.loads(cleaned)
+    except Exception:
+        match = re.search(r'\{.*\}', cleaned, re.DOTALL)
+        if match:
+            try: return json.loads(match.group())
+            except: pass
+    return None
 
-# ── Parameter source documentation (used in prompts + UI) ─────────────────
-PARAMETER_SOURCES = {
-    "safety_stock":    "Material Master (Current Inventory shows 0 for all SKUs — known data quality issue)",
-    "lead_time":       "Material Master — max(Planned Delivery Time, Inhouse Production Time). BOM has no numeric lead time field.",
-    "fixed_lot_size":  "Material Master — Fixed Lot Size column",
-    "demand_proxy":    "Sales file — original_confirmed_qty. Note: includes write-offs and internal consumption. Not netted off.",
-    "aria_rec_ss":     "ARIA formula: 1.65 × σ_demand × √(lead_time/30). Service factor 1.65 = 95th percentile. σ from monthly sales demand.",
-}
+SYSTEM_PROMPT = """You are ARIA — an agentic supply chain intelligence system for Revvity Turku plant FI11.
 
+You reason step-by-step like a senior procurement analyst.
+Rules:
+- Cite specific numbers always.
+- Reference actual periods (e.g. "Nov 2025").
+- Connect patterns to consequences.
+- Surface lead time and transit days prominently.
+- Use the provided pre‑computed data: Monte Carlo probability, BOM risks, supplier consolidation.
 
-# ── Replenishment calculation ──────────────────────────────────────────────
-def calc_replenishment(current_stock: float, safety_stock: float,
-                       fixed_lot_size: float, avg_monthly_demand: float) -> dict:
-    """
-    Stakeholder-specified replenishment formula:
-    Trigger: current_stock < safety_stock
-    Quantity: max(gap_to_safety_stock, fixed_lot_size)
-    """
-    gap_to_ss   = max(0.0, safety_stock - current_stock)
-    lot_size_ok = fixed_lot_size > 0
-    ss_ok       = safety_stock > 0
-
-    if not ss_ok:
-        return {
-            "trigger":    False,
-            "quantity":   0,
-            "gap_to_ss":  gap_to_ss,
-            "reason":     "Cannot calculate — safety stock not configured (data gap)",
-            "data_gap":   True,
-        }
-
-    triggered = current_stock < safety_stock
-    if not triggered:
-        return {
-            "trigger":   False,
-            "quantity":  0,
-            "gap_to_ss": 0,
-            "reason":    "Stock above safety stock — no replenishment triggered",
-            "data_gap":  False,
-        }
-
-    if not lot_size_ok:
-        return {
-            "trigger":   True,
-            "quantity":  max(int(gap_to_ss), int(avg_monthly_demand)),
-            "gap_to_ss": int(gap_to_ss),
-            "reason":    "Lot size not configured — using gap to safety stock as minimum",
-            "data_gap":  True,
-        }
-
-    qty = max(gap_to_ss, fixed_lot_size)
-    return {
-        "trigger":   True,
-        "quantity":  int(qty),
-        "gap_to_ss": int(gap_to_ss),
-        "reason":    f"max(gap_to_SS={int(gap_to_ss)}, lot_size={int(fixed_lot_size)}) = {int(qty)} units",
-        "data_gap":  False,
-    }
-
-
-# ── System prompt ──────────────────────────────────────────────────────────
-SYSTEM_PROMPT = """You are ARIA — Adaptive Risk Intelligence Agent — a senior supply chain analyst 
-embedded inside Revvity's supply chain intelligence platform for their Turku manufacturing plant (FI11).
-
-Your role is to analyse material data and produce sharp, actionable intelligence briefings.
-You write like a seasoned analyst giving a briefing to a VP of Supply Chain — concise, factual, 
-direct, no filler words. You cite specific numbers. You connect patterns to consequences.
-
-PARAMETER SOURCES (always use these, always document):
-- Safety Stock: Material Master (Current Inventory shows 0 for all SKUs — known data quality issue)
-- Lead Time: Material Master max(Planned Delivery Time, Inhouse Production Time)
-- Fixed Lot Size: Material Master
-- Demand: Sales file — includes write-offs and internal consumption (not netted off)
-- ARIA SS formula: 1.65 × σ_demand × √(lead_time/30) at 95% service level
-
-REPLENISHMENT RULE (non-negotiable):
-When stock < safety stock, recommended order = max(gap_to_safety_stock, fixed_lot_size)
-Always surface lead time in the recommendation. Higher lead time = more urgent to act.
-
-Format replenishment recommendations exactly like this:
-• SKU: [id]
-• Current inventory: [n] units
-• Safety stock: [n] units [BELOW / ABOVE threshold]
-• Lead time (source: Material Master): [n] days
-• Fixed lot size: [n] units
-• Recommended order: [Immediate / This week / Monitor], for [n] units
-• Reason: [one sentence with numbers]
-
-You always structure your JSON response with these exact keys:
-- "headline": one sentence, the single most important thing (max 20 words)
-- "verdict": "CRITICAL" | "WARNING" | "HEALTHY" | "INSUFFICIENT_DATA"  
-- "executive_summary": 3-4 sentences. What is happening, why it matters, what the pattern is.
-- "key_findings": array of exactly 3 findings, each a plain English sentence with a specific number
-- "sap_gap": one sentence describing what SAP is missing or getting wrong
-- "recommendation": formatted per the replenishment template above
-- "risk_if_ignored": one sentence describing the consequence of inaction
-- "data_confidence": "HIGH" | "MEDIUM" | "LOW" with one sentence explanation
-- "data_quality_flags": array of data quality issues found (empty array if none)
-- "bom_risk": one sentence about upstream BOM / supplier risk (null if no BOM data)
-
-Return ONLY the JSON object. No markdown, no code blocks, no preamble."""
-
+Return ONLY valid JSON. No markdown, no code fences.
+JSON keys required:
+- headline: one sentence, max 20 words.
+- verdict: CRITICAL | WARNING | HEALTHY | INSUFFICIENT_DATA.
+- executive_summary: 3-4 sentences.
+- key_findings: array of exactly 3 specific numbered findings.
+- sap_gap: one sentence on what SAP is missing.
+- recommendation: structured recommendation with SKU/inventory/SS/lead-time/lot-size/order-qty/reason.
+- risk_if_ignored: one sentence consequence.
+- data_confidence: HIGH | MEDIUM | LOW — one sentence explanation.
+- data_quality_flags: array of data quality issues.
+- bom_risk: one sentence on BOM/supplier risk (null if no BOM).
+- supplier_action: if replenishment needed, draft a one-sentence action for procurement team.
+- consolidation_opportunity: if applicable, mention which supplier also supplies other materials.
+"""
 
 def analyse_material(client: AzureOpenAI, deployment: str, context: dict) -> dict:
-    """
-    Run ARIA agent analysis for one material.
-    context should include: replenishment_recommendation, bom_components, data_quality_flags
-    """
-    # Pre-compute replenishment recommendation to inject into prompt
-    repl = context.get("replenishment_recommendation", {})
-    repl_text = ""
-    if repl.get("trigger"):
-        repl_text = (
-            f"Pre-computed replenishment: ORDER {repl['quantity']} units "
-            f"(gap_to_SS={repl['gap_to_ss']}, lot_size={context.get('lot_size', 0)}, "
-            f"formula: max(gap, lot_size))"
-        )
-    else:
-        repl_text = f"No replenishment triggered: {repl.get('reason', 'stock above safety stock')}"
+    """Agentic analysis using pre‑computed data."""
+    repl = context.get("replenishment", {})
+    repl_text = (
+        f"REPLENISHMENT REQUIRED: Order {repl['quantity']} units "
+        f"(Shortfall={repl['shortfall']}, Formula: {repl['formula']})"
+        if repl.get("triggered")
+        else f"No replenishment triggered: {repl.get('reason','stock above safety stock')}"
+    )
 
-    # BOM context
+    # Pre‑compute Monte Carlo using the context numbers
+    mc_prob = None
+    if context["demand_stats"]["std_monthly"] > 0:
+        mc = run_monte_carlo(context["sih"], context["safety_stock_sap"],
+                             context["demand_stats"]["avg_monthly"],
+                             context["demand_stats"]["std_monthly"],
+                             context["lead_time_days"])
+        mc_prob = mc["probability_breach_pct"]
+
     bom = context.get("bom_components", [])
-    bom_text = ""
-    if bom:
-        missing_sup = [b for b in bom if b.get("supplier") == "Not specified"]
-        sup_names   = list(set(b["supplier"] for b in bom if b.get("supplier") != "Not specified"))
-        bom_text = (
-            f"BOM: {len(bom)} components. Suppliers: {', '.join(sup_names[:4]) if sup_names else 'none named'}. "
-            f"Missing supplier data: {len(missing_sup)} components."
-        )
+    external_bom = [b for b in bom if not b.get("inhouse") and not b.get("supplier","").startswith("⚠")]
+    missing_bom  = [b for b in bom if b.get("supplier","").startswith("⚠")]
+    fixed_qty    = [b for b in bom if b.get("fixed_qty")]
 
-    # Data quality flags
-    dq_flags = context.get("data_quality_flags", [])
-    dq_text  = "Data quality flags: " + ("; ".join(dq_flags) if dq_flags else "None")
+    consolidation = context.get("supplier_consolidation", [])
+    consol_text = ""
+    if consolidation:
+        consol_text = "SUPPLIER CONSOLIDATION: " + "; ".join([
+            f"{c['supplier']} also supplies {c['also_supplies']} other finished goods (transit {c.get('transit_days','?')}d)"
+            for c in consolidation[:3]
+        ])
 
-    user_prompt = f"""Analyse this material for supply chain risk and produce your intelligence briefing.
+    prompt = f"""Analyse this supply chain material and produce an agentic intelligence briefing.
 
-MATERIAL DATA:
+MATERIAL CONTEXT:
 {json.dumps(context, indent=2, default=str)}
 
 PRE-COMPUTED REPLENISHMENT:
 {repl_text}
 
-BOM CONTEXT:
-{bom_text if bom_text else "No BOM data available"}
+MONTE CARLO: {mc_prob}% probability of stockout in next 6 months (if computed).
 
-{dq_text}
+LEAD TIME URGENCY: {context.get('lt_urgency','unknown')}
 
-Focus on:
-1. Whether current stock is genuinely safe given real demand patterns
-2. Whether SAP's configured safety stock makes sense (SAP SS comes from Material Master)
-3. Historical breach events and what pattern caused them
-4. Lead time: {context.get('lead_time_days', 'N/A')} days — surface this prominently in recommendation
-5. BOM upstream risks if this is a finished good
-6. The current trend — rising, stable, or declining?
+BOM FACTS:
+- Total components: {len(bom)}
+- External components (need procurement): {len(external_bom)}
+- Missing supplier data: {len(missing_bom)} components
+- Fixed quantity (order exactly 1): {len(fixed_qty)} components
+{consol_text}
 
-Use the pre-computed replenishment quantity in your recommendation.
-Be specific with numbers. Reference actual periods when discussing events.
+STEP-BY-STEP ANALYSIS REQUIRED:
+1. Is current stock genuinely safe given lead time? Compare days_cover vs lead_time_days.
+2. Is the SAP safety stock calibrated correctly vs ARIA recommended?
+3. What pattern caused the {len(context.get('breach_periods',[]))} historical breaches?
+4. What is the BOM/supplier risk upstream (including supplier reliability, geo risk, transit times)?
+5. What specific action should procurement take TODAY (including consolidation if beneficial)?
+
+Format the recommendation section EXACTLY as:
+SKU: [id] — [name]
+Current inventory: [n] units  
+Safety stock (Material Master): [n] units — [BELOW/ABOVE threshold]
+Lead time (Material Master): [n] days — [CRITICAL/OK relative to days cover]
+Fixed lot size: [n] units
+Recommended order: [Immediate/This week/Monitor], [n] units
+Reason: [specific sentence with numbers]
+
+If consolidation opportunity exists, add a line: "Consolidation: order together with [other materials] from [supplier] to save logistics cost."
 """
 
-    response = client.chat.completions.create(
-        model=deployment,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user",   "content": user_prompt},
-        ],
-        temperature=0.2,
-        max_tokens=900,
-    )
-
-    raw = response.choices[0].message.content.strip()
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-    raw = raw.strip()
-
     try:
-        result = json.loads(raw)
-        # Ensure new fields exist
-        if "data_quality_flags" not in result:
-            result["data_quality_flags"] = dq_flags
-        if "bom_risk" not in result:
-            result["bom_risk"] = None
-        return result
-    except json.JSONDecodeError:
+        response = client.chat.completions.create(
+            model=deployment,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user",   "content": prompt},
+            ],
+            temperature=0.15,
+            max_tokens=1200,
+        )
+        raw = response.choices[0].message.content.strip()
+        result = _parse_json(raw)
+        if result:
+            result.setdefault("data_quality_flags", context.get("data_quality_flags", []))
+            result.setdefault("bom_risk", None)
+            result.setdefault("supplier_action", None)
+            result.setdefault("consolidation_opportunity", None)
+            return result
+        # Fallback
         return {
-            "headline":           "Analysis complete — see findings below.",
-            "verdict":            context.get("risk_status", "UNKNOWN"),
-            "executive_summary":  raw[:400],
-            "key_findings":       ["Data analysed.", "See summary above.", "Manual review recommended."],
-            "sap_gap":            "Unable to parse structured response.",
-            "recommendation":     repl_text,
-            "risk_if_ignored":    "Unknown.",
-            "data_confidence":    "LOW — response parse error.",
-            "data_quality_flags": dq_flags,
-            "bom_risk":           None,
+            "headline": "Analysis requires review — see findings below",
+            "verdict": context.get("risk_status","UNKNOWN"),
+            "executive_summary": raw[:500] if raw else "No response from agent.",
+            "key_findings": [repl_text, f"Lead time urgency: {context.get('lt_urgency','N/A')}", f"Monte Carlo breach prob: {mc_prob}%"],
+            "sap_gap": f"SAP Safety Stock: {context.get('safety_stock_sap','N/A')} units. ARIA recommends: {context.get('rec_safety_stock','N/A')} units.",
+            "recommendation": repl_text,
+            "risk_if_ignored": "Review replenishment status immediately." if repl.get("triggered") else "Monitor stock levels.",
+            "data_confidence": "LOW — JSON parse issue.",
+            "data_quality_flags": context.get("data_quality_flags", []),
+            "bom_risk": None,
+            "supplier_action": None,
+            "consolidation_opportunity": None,
+        }
+    except Exception as e:
+        return {
+            "headline": "Agent connection error",
+            "verdict": context.get("risk_status","UNKNOWN"),
+            "executive_summary": f"Error: {str(e)[:200]}",
+            "key_findings": [repl_text, "Check Azure API key.", "Review data manually."],
+            "sap_gap": "Unable to connect to agent.",
+            "recommendation": repl_text,
+            "risk_if_ignored": "Manual review required.",
+            "data_confidence": "LOW — connection error.",
+            "data_quality_flags": context.get("data_quality_flags", []),
+            "bom_risk": None, "supplier_action": None, "consolidation_opportunity": None,
         }
 
+def run_monte_carlo(current_stock: float, safety_stock: float, avg_demand: float,
+                    std_demand: float, lead_time: float, months: int = 6, n_sims: int = 1000) -> dict:
+    random.seed(42)
+    breach_count = 0
+    end_stocks = []
+    breach_months = []
+    for _ in range(n_sims):
+        stock = current_stock
+        breached = False
+        breach_m = None
+        for m in range(months):
+            d = max(0.0, random.gauss(avg_demand, std_demand))
+            stock = max(0.0, stock - d)
+            if stock < safety_stock and not breached:
+                breached = True
+                breach_m = m + 1
+        if breached:
+            breach_count += 1
+            breach_months.append(breach_m)
+        end_stocks.append(stock)
+    end_stocks.sort()
+    p_breach = round(breach_count / n_sims * 100, 1)
+    p10 = end_stocks[int(0.10 * n_sims)]
+    p50 = end_stocks[int(0.50 * n_sims)]
+    p90 = end_stocks[int(0.90 * n_sims)]
+    avg_breach_month = round(sum(breach_months) / len(breach_months), 1) if breach_months else None
+    return {
+        "n_simulations": n_sims,
+        "months_simulated": months,
+        "probability_breach_pct": p_breach,
+        "avg_breach_month": avg_breach_month,
+        "p10_end_stock": round(p10, 0),
+        "p50_end_stock": round(p50, 0),
+        "p90_end_stock": round(p90, 0),
+        "end_stock_distribution": [round(v, 0) for v in end_stocks[::10]],
+        "verdict": "HIGH RISK" if p_breach>50 else ("MODERATE RISK" if p_breach>20 else ("LOW RISK" if p_breach>5 else "VERY LOW RISK")),
+    }
 
-def simulate_scenario(
-    client: AzureOpenAI,
-    deployment: str,
-    material_name: str,
-    current_stock: float,
-    safety_stock: float,
-    lead_time: float,
-    fixed_lot_size: float,
-    demand_scenarios: dict,
-    order_action: dict = None,
-    disruption_days: int = None,
-) -> dict:
-    """
-    Agent interprets a scenario simulation and gives a verdict.
-    demand_scenarios: {"low": x, "expected": y, "high": z}
-    order_action: {"quantity": n, "timing_days": d} or None
-    disruption_days: if set, run supply disruption simulation instead of demand shock
-    """
-    if disruption_days is not None:
-        # Supply disruption simulation
-        prompt = f"""You are analysing a SUPPLY DISRUPTION scenario for {material_name}.
+def draft_supplier_email(client: AzureOpenAI, deployment: str, supplier_name: str, supplier_email: str,
+                         materials: list, plant_name: str = "Revvity Turku FI11") -> str:
+    order_lines = "\n".join([f"  - {m['name']}: {m['quantity']} units (lot size: {m['lot_size']})" for m in materials])
+    prompt = f"""Draft a professional procurement order email to {supplier_name} ({supplier_email}).
+Plant: {plant_name}
+Materials to order:
+{order_lines}
 
-CURRENT STATE:
-- Stock on hand: {current_stock} units
-- SAP Safety stock (Material Master): {safety_stock} units
-- Lead time (Material Master): {lead_time} days
-- Fixed lot size (Material Master): {fixed_lot_size} units
-- Monthly demand (avg): {demand_scenarios.get('expected', 0):.1f} units
+Requirements:
+- Professional but concise (under 150 words)
+- Include subject line
+- Reference urgency where stock is below safety stock
+- Include contact request for lead time confirmation
+- Sign off as ARIA Supply Intelligence System, {plant_name}
 
-DISRUPTION SCENARIO:
-No replenishment possible for {disruption_days} days. Calculate:
-
-1. Daily demand rate: {demand_scenarios.get('expected', 0)/30:.1f} units/day
-2. Stock consumed during disruption: {disruption_days} × daily_demand
-3. Remaining stock after disruption: current_stock - consumed
-4. Does stock breach safety stock during disruption? When?
-5. Shortfall below safety stock if breach occurs?
-
-Return JSON with keys:
-- "breach_occurs": boolean
-- "breach_day": number or null (which day stock falls below SS)
-- "shortfall_units": number (how far below SS at end of disruption, 0 if no breach)
-- "stock_at_end": number (projected stock after disruption period)
-- "recommended_emergency_action": string (one sentence)
-- "simulation_verdict": string (one plain English sentence)  
-- "urgency": "ACT TODAY" | "ACT THIS WEEK" | "MONITOR" | "SAFE"
-- "priority_rank": number 1-5 (1=most critical)
-"""
-    else:
-        # Standard demand shock simulation
-        prompt = f"""You are analysing a supply chain simulation for {material_name}.
-
-CURRENT STATE:
-- Stock on hand: {current_stock} units
-- SAP Safety stock (Material Master): {safety_stock} units  
-- Lead time (Material Master): {lead_time} days
-- Fixed lot size (Material Master): {fixed_lot_size} units
-
-DEMAND SCENARIOS FOR NEXT 6 MONTHS:
-- Low demand: {demand_scenarios['low']:.1f} units/month
-- Expected demand: {demand_scenarios['expected']:.1f} units/month
-- High demand (shock): {demand_scenarios['high']:.1f} units/month
-
-REPLENISHMENT RULE: If order placed, quantity = max(gap_to_SS, fixed_lot_size) = max({max(0, safety_stock-current_stock):.0f}, {fixed_lot_size:.0f}) = {max(max(0, safety_stock-current_stock), fixed_lot_size):.0f} units
-ORDER ACTION: {"No order — do nothing scenario" if not order_action else f"Order {order_action['quantity']} units, arriving in {order_action.get('timing_days', lead_time):.0f} days"}
-
-Calculate for each scenario how many months until stockout. Return JSON with:
-- "low_months_safe": number (999 if never stockout)
-- "expected_months_safe": number
-- "high_months_safe": number  
-- "order_prevents_breach": boolean
-- "min_order_recommended": number (using max(gap, lot_size) formula)
-- "simulation_verdict": one sentence plain English
-- "urgency": "ACT TODAY" | "ACT THIS WEEK" | "MONITOR" | "SAFE"
-"""
-
-    response = client.chat.completions.create(
-        model=deployment,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.1,
-        max_tokens=500,
-    )
-
-    raw = response.choices[0].message.content.strip()
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-    raw = raw.strip()
-
+Return just the email text with Subject: on first line."""
     try:
-        return json.loads(raw)
-    except Exception:
-        if disruption_days is not None:
-            daily = demand_scenarios.get("expected", 0) / 30
-            consumed = daily * disruption_days
-            remaining = current_stock - consumed
-            breach = remaining < safety_stock
-            return {
-                "breach_occurs":               breach,
-                "breach_day":                  int(safety_stock / daily) if breach and daily > 0 else None,
-                "shortfall_units":             int(max(0, safety_stock - remaining)) if breach else 0,
-                "stock_at_end":                max(0, int(remaining)),
-                "recommended_emergency_action": "Review stock position immediately.",
-                "simulation_verdict":          "Simulation complete. Manual review recommended.",
-                "urgency":                     "ACT TODAY" if breach else "MONITOR",
-                "priority_rank":               1 if breach else 4,
-            }
-        else:
-            return {
-                "low_months_safe":       999,
-                "expected_months_safe":  3,
-                "high_months_safe":      1,
-                "order_prevents_breach": bool(order_action),
-                "min_order_recommended": int(max(max(0, safety_stock-current_stock), fixed_lot_size)),
-                "simulation_verdict":    "Simulation complete. Review parameters.",
-                "urgency":               "MONITOR",
-            }
+        response = client.chat.completions.create(
+            model=deployment,
+            messages=[{"role":"user","content":prompt}],
+            temperature=0.3, max_tokens=350,
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        return f"Error drafting email: {str(e)[:100]}"
 
+def interpret_chart(client: AzureOpenAI, deployment: str, chart_type: str, chart_data: dict, question: str = None) -> str:
+    q = question or f"Interpret this {chart_type} and provide 2-3 actionable insights for supply chain managers."
+    prompt = f"""You are ARIA, a supply chain analyst. Interpret this {chart_type} data and give concise actionable insights.
 
-def simulate_multi_sku_disruption(
-    client: AzureOpenAI,
-    deployment: str,
-    disruption_days: int,
-    sku_data: list,
-) -> list:
-    """
-    Multi-SKU supply disruption simulation.
-    sku_data: list of dicts with keys: material, name, current_stock, safety_stock,
-              lead_time, fixed_lot_size, avg_monthly_demand, risk
-    Returns ranked list of SKUs by breach severity.
-    """
+DATA:
+{json.dumps(chart_data, default=str)[:1500]}
+
+{q}
+
+Rules: Under 120 words. Plain English sentences. Cite specific numbers. Focus on what action to take."""
+    try:
+        response = client.chat.completions.create(
+            model=deployment,
+            messages=[{"role":"user","content":prompt}],
+            temperature=0.2, max_tokens=200,
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        return f"Interpretation unavailable: {str(e)[:80]}"
+
+def simulate_scenario(client: AzureOpenAI, deployment: str, material_name: str, current_stock: float,
+                      safety_stock: float, lead_time: float, fixed_lot_size: float,
+                      demand_scenarios: dict, order_action: dict = None, disruption_days: int = None) -> dict:
+    if disruption_days is not None:
+        daily = demand_scenarios.get("expected", 0) / 30
+        consumed = daily * disruption_days
+        remaining = current_stock - consumed
+        breach = remaining < safety_stock if safety_stock > 0 else False
+        shortfall = max(0, safety_stock - remaining)
+        lot = fixed_lot_size
+        qty = math.ceil(shortfall / lot) * lot if lot > 0 and shortfall > 0 else shortfall
+        prompt = f"""Supply disruption scenario for {material_name}:
+- Duration: {disruption_days} days of no replenishment
+- Current stock: {current_stock} units
+- Safety stock: {safety_stock} units
+- Daily demand: {daily:.1f} units/day
+- Stock at end: {max(0,remaining):.0f} units
+- Breach: {breach} (shortfall: {shortfall:.0f} units if breach)
+- Emergency order needed: {qty:.0f} units
+
+Return JSON: breach_occurs, days_to_breach, shortfall_units, stock_at_end, 
+recommended_emergency_action, simulation_verdict, urgency (ACT TODAY/ACT THIS WEEK/MONITOR/SAFE), priority_rank (1-5)"""
+        default = {
+            "breach_occurs": breach, "days_to_breach": int(safety_stock/daily) if daily>0 and breach else None,
+            "shortfall_units": int(shortfall), "stock_at_end": max(0,int(remaining)),
+            "recommended_emergency_action": f"Emergency order {qty:.0f} units." if breach else "Monitor.",
+            "simulation_verdict": "Breach detected." if breach else "Safe for disruption period.",
+            "urgency": "ACT TODAY" if (breach and remaining<0) else ("ACT THIS WEEK" if breach else "MONITOR"),
+            "priority_rank": 1 if breach else 4,
+        }
+    else:
+        shortfall = max(0, safety_stock - current_stock)
+        lot = fixed_lot_size
+        min_order = math.ceil(shortfall / lot) * lot if lot > 0 and shortfall > 0 else shortfall
+        prompt = f"""Demand simulation for {material_name}:
+- Current stock: {current_stock}, Safety stock: {safety_stock}, Lead time: {lead_time}d
+- Lot size: {fixed_lot_size}
+- Scenarios: Low={demand_scenarios['low']:.0f}/mo, Expected={demand_scenarios['expected']:.0f}/mo, High={demand_scenarios['high']:.0f}/mo
+- Order placed: {json.dumps(order_action) if order_action else 'None'}
+- Minimum order (CEILING formula): {min_order:.0f} units
+
+Return JSON: low_months_safe, expected_months_safe, high_months_safe, 
+order_prevents_breach, min_order_recommended, simulation_verdict, urgency"""
+        default = {
+            "low_months_safe":999,"expected_months_safe":3,"high_months_safe":1,
+            "order_prevents_breach":bool(order_action),
+            "min_order_recommended":int(min_order),
+            "simulation_verdict":"Review parameters.","urgency":"MONITOR",
+        }
+    try:
+        response = client.chat.completions.create(
+            model=deployment,
+            messages=[{"role":"user","content":prompt}],
+            temperature=0.1, max_tokens=400,
+        )
+        result = _parse_json(response.choices[0].message.content.strip())
+        return result if result else default
+    except:
+        return default
+
+def simulate_multi_sku_disruption(client, deployment, disruption_days: int, sku_data: list) -> list:
     results = []
     for sku in sku_data:
         daily = sku["avg_monthly_demand"] / 30 if sku["avg_monthly_demand"] > 0 else 0
@@ -360,93 +1073,34 @@ def simulate_multi_sku_disruption(
         remaining = sku["current_stock"] - consumed
         ss = sku["safety_stock"]
         breach = remaining < ss if ss > 0 else False
-
+        shortfall = max(0, ss - remaining)
+        fls = sku["fixed_lot_size"]
+        qty = math.ceil(shortfall / fls) * fls if fls > 0 and shortfall > 0 else shortfall
         days_to_breach = None
         if breach and daily > 0 and ss > 0:
-            stock_above_ss = sku["current_stock"] - ss
-            if stock_above_ss > 0:
-                days_to_breach = int(stock_above_ss / daily)
-            else:
-                days_to_breach = 0  # already breached
-
-        shortfall = max(0, ss - remaining) if breach else 0
-        lot = sku["fixed_lot_size"]
-        reorder_qty = int(max(shortfall, lot)) if lot > 0 else int(shortfall)
-
+            ab = sku["current_stock"] - ss
+            days_to_breach = max(0, int(ab / daily)) if ab > 0 else 0
         results.append({
-            "material":        sku["material"],
-            "name":            sku["name"],
-            "breach_occurs":   breach,
-            "days_to_breach":  days_to_breach,
-            "shortfall_units": int(shortfall),
-            "stock_at_end":    max(0, int(remaining)),
-            "reorder_qty":     reorder_qty,
-            "lead_time":       sku["lead_time"],
-            "severity_score":  (shortfall * 2 + (disruption_days - (days_to_breach or disruption_days)))
-                               if breach else 0,
+            "material":sku["material"],"name":sku["name"],"breach_occurs":breach,
+            "days_to_breach":days_to_breach,"shortfall_units":int(shortfall),
+            "stock_at_end":max(0,int(remaining)),"reorder_qty":int(qty),
+            "lead_time":sku["lead_time"],"severity_score":shortfall*2+max(0,disruption_days-(days_to_breach or disruption_days)) if breach else 0,
         })
-
-    # Sort: breaches first (by days to breach ascending), then non-breaches
-    results.sort(key=lambda x: (
-        0 if x["breach_occurs"] else 1,
-        x["days_to_breach"] if x["days_to_breach"] is not None else 999,
-        -x["shortfall_units"]
-    ))
+    results.sort(key=lambda x:(0 if x["breach_occurs"] else 1, x["days_to_breach"] if x["days_to_breach"] is not None else 999,-x["shortfall_units"]))
     return results
 
-
-def generate_data_quality_report(client: AzureOpenAI, deployment: str, dq_summary: dict) -> str:
-    """
-    Generate a natural language data quality summary using the agent.
-    dq_summary: dict with per-material quality flags.
-    """
-    prompt = f"""You are ARIA, a supply chain data quality analyst for Revvity Turku plant FI11.
-
-Review this data quality summary and produce a concise 3-sentence assessment.
-Identify the most critical data gaps that could mislead supply chain decisions.
-Be specific about which materials are affected and why it matters.
-
-DATA QUALITY SUMMARY:
-{json.dumps(dq_summary, indent=2)}
-
-Write plain English, no bullet points. Under 80 words. Focus on what matters most for procurement decisions."""
-
+def chat_with_data(client: AzureOpenAI, deployment: str, question: str, context: str) -> str:
+    system = """You are ARIA, a supply chain intelligence agent for Revvity Turku FI11.
+Answer concisely with specific numbers. Under 150 words. Plain English sentences."""
     try:
         response = client.chat.completions.create(
             model=deployment,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
-            max_tokens=200,
+            messages=[
+                {"role":"system","content":system},
+                {"role":"user","content":f"CONTEXT:\n{context}\n\nQUESTION: {question}"},
+            ],
+            temperature=0.3, max_tokens=250,
         )
         return response.choices[0].message.content.strip()
-    except Exception:
-        return "Data quality assessment unavailable. Review individual material flags in the table above."
-
-
-def chat_with_data(
-    client: AzureOpenAI,
-    deployment: str,
-    question: str,
-    all_context: str,
-) -> str:
-    """
-    General Q&A agent — user asks a free-form question about supply chain data.
-    """
-    system = """You are ARIA, a supply chain intelligence agent for Revvity Turku plant (FI11).
-Answer questions about the supply chain data concisely and with specific numbers.
-Key parameter sources: Safety Stock from Material Master, Lead Time from Material Master 
-(max of Planned Delivery and Inhouse Production), Lot Size from Material Master, 
-Demand from Sales file (includes write-offs and internal consumption).
-Replenishment formula: max(gap_to_safety_stock, fixed_lot_size).
-Keep answers under 150 words. Use plain English. Write in flowing sentences."""
-
-    response = client.chat.completions.create(
-        model=deployment,
-        messages=[
-            {"role": "system",  "content": system},
-            {"role": "user",    "content": f"DATA CONTEXT:\n{all_context}\n\nQUESTION: {question}"},
-        ],
-        temperature=0.3,
-        max_tokens=250,
-    )
-    return response.choices[0].message.content.strip()
+    except Exception as e:
+        return f"Error: {str(e)[:100]}"
